@@ -1,5 +1,7 @@
 {
   "name": "postgrest-mcp",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "cloudflare:dev": "wrangler dev --port 3000",

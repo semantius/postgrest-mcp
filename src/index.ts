@@ -5,15 +5,8 @@ import {
 } from "@hono/mcp";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import mcp from "./mcp.ts";
-
-// Platform-agnostic environment variable access
-// Works with both Node.js (process.env) and Deno (Deno.env) 
-const getEnv = (key: string): string | undefined => {
-  if (typeof process !== "undefined" && process.env) return process.env[key];
-  if (typeof Deno !== "undefined" && Deno.env) return Deno.env.get(key);
-  return undefined;
-};
+import { createMcpServer } from "./mcp.ts";
+import { getEnv } from "./utils/env.ts";
 
 const SUPABASE_URL = getEnv("SUPABASE_URL");
 const BASE_HOST = SUPABASE_URL ? new URL(SUPABASE_URL).host : "";
@@ -52,6 +45,25 @@ app.all(
     }
   }),
   async (c) => {
+    // Extract auth token from Authorization header
+    const authHeader = c.req.header('authorization') || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
+    
+    // Capture request context
+    const requestContext = {
+      method: c.req.method,
+      url: c.req.url,
+      headers: Object.fromEntries(c.req.raw.headers.entries()),
+      query: Object.fromEntries(new URL(c.req.url).searchParams.entries()),
+      body: c.req.method !== 'GET' ? await c.req.raw.clone().text().catch(() => undefined) : undefined,
+    };
+
+    // Create auth info
+    const authInfo = token ? { token } : undefined;
+
+    // Create MCP server with request context and auth info
+    const mcp = createMcpServer(requestContext, authInfo);
+    
     console.log(mcp.isConnected() ? "MCP connected" : "MCP not connected");
 
     if (!mcp.isConnected()) {
