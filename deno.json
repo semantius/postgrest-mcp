@@ -1,0 +1,23 @@
+{
+  "tasks": {
+    "dev": "deno run --allow-net --allow-env --watch src/index.deno.ts",
+    "start": "deno run --allow-net --allow-env src/index.deno.ts",
+    "deploy": "deno deploy --prod",
+    "supabase:dev": "supabase functions serve postgrest-mcp --import-map deno.json",
+    "supabase:deploy": "supabase functions deploy postgrest-mcp --no-verify-jwt --import-map deno.json"
+  },
+  "imports": {
+    "@hono/mcp": "npm:@hono/mcp@^0.2.3",
+    "@modelcontextprotocol/sdk/server/mcp.js": "npm:@modelcontextprotocol/sdk@^1.25.2/server/mcp.js",
+    "hono": "npm:hono@^4.11.4",
+    "hono/cors": "npm:hono@^4.11.4/cors",
+    "jose": "npm:jose@^6.1.3",
+    "zod/v4": "npm:zod@^4.3.5/v4"
+  },
+  "compilerOptions": {
+    "lib": [
+      "deno.window",
+      "deno.unstable"
+    ]
+  }
+}

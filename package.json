@@ -1,0 +1,18 @@
+{
+  "name": "postgrest-mcp",
+  "type": "module",
+  "scripts": {
+    "cloudflare:dev": "wrangler dev --port 3000",
+    "cloudflare:deploy": "wrangler deploy --minify",
+    "cf-typegen": "wrangler types --env-interface CloudflareBindings",
+    "deno:dev": "deno task dev",
+    "deno:deploy": "deno task deploy"
+  },
+  "dependencies": {
+    "@hono/mcp": "^0.2.3",
+    "@modelcontextprotocol/sdk": "^1.25.2",
+    "hono": "^4.11.4",
+    "jose": "^6.1.3",
+    "zod": "^4.3.5"
+  }
+}

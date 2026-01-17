@@ -1,0 +1,6 @@
+# Supabase Edge Functions configuration
+[edge_runtime]
+policy = "per_worker"
+
+[functions.postgrest-mcp]
+verify_jwt = false
