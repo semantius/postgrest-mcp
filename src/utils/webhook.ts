@@ -31,8 +31,10 @@ export async function computeWebhookSignature(
   // Sign the message
   const signature = await crypto.subtle.sign('HMAC', key, messageData);
   
-  // Convert to base64
-  const base64Signature = btoa(String.fromCharCode(...new Uint8Array(signature)));
+  // Convert to base64 efficiently (avoiding spread operator for large arrays)
+  const signatureArray = new Uint8Array(signature);
+  const binaryString = Array.from(signatureArray, byte => String.fromCharCode(byte)).join('');
+  const base64Signature = btoa(binaryString);
   
   return `v1,${base64Signature}`;
 }

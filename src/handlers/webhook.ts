@@ -54,7 +54,8 @@ export async function handleWebhook(c: Context) {
     });
 
     const webhookId = headers['webhook-id'];
-    const webhookTimestampStr = headers['webhook-timestamp'] || '1234567890';
+    // Use current timestamp if not provided (in seconds since epoch)
+    const webhookTimestampStr = headers['webhook-timestamp'] || Math.floor(Date.now() / 1000).toString();
     const webhookSignature = headers['webhook-signature'];
     const bodyStr = requestData.body;
 
@@ -121,14 +122,17 @@ export async function handleWebhook(c: Context) {
       idempotencyKey = webhookSignature;
     }
 
-    // If still no idempotency_key, compute one
+    // If still no idempotency_key, compute one based on webhook content
+    // This ensures idempotency even for webhooks without authentication
     if (!idempotencyKey) {
-      const defaultSecret = receiver.secret || 'default_secret';
+      // Generate a hash from webhook data for idempotency
+      // Use a combination that's unique to this specific webhook
+      const idempotencySource = `${webhookReceiverId}-${webhookTimestampStr}-${bodyStr}`;
       idempotencyKey = await computeWebhookSignature(
-        webhookId || 'no-id',
+        webhookId || 'anon',
         webhookTimestampStr,
         bodyStr,
-        defaultSecret
+        receiver.secret || idempotencySource // Use content itself as secret if none available
       );
     }
 

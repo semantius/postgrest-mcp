@@ -399,7 +399,7 @@ curl -X POST http://localhost:3000/hook/123 \
 
 ### Test 12: Missing Timestamp (Default Behavior)
 
-**Description:** Test that missing webhook-timestamp uses default value 1234567890.
+**Description:** Test that missing webhook-timestamp uses current timestamp.
 
 **Request:**
 ```bash
@@ -416,7 +416,7 @@ curl -X POST http://localhost:3000/hook/124 \
 **Expected Response:** 200 OK
 
 **Validation:**
-- Verify webhook_timestamp in the log entry is 1234567890 (or equivalent date)
+- Verify webhook_timestamp in the log entry is approximately the current time (within a few seconds)
 
 ---
 
