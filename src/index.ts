@@ -62,7 +62,9 @@ app.all(
     const authInfo = token ? { token } : undefined;
 
     // Create MCP server with request context and auth info
-    const mcp = createMcpServer(requestContext, authInfo);        
+    const mcp = createMcpServer(requestContext, authInfo);
+    
+    console.log(mcp.isConnected() ? "MCP connected" : "MCP not connected");
 
     if (!mcp.isConnected()) {
       await mcp.connect(transport);

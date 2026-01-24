@@ -1,13 +1,15 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import { echoTool } from './tools/echo.ts'
+import { getCurrentUserTool } from './tools/getCurrentUser.ts'
 import { postgrestRequestTool } from './tools/postgrestRequest.ts'
 import { sqlToRestTool } from './tools/sqlToRest.ts'
 
 
 // Define an array of tools to register
 const tools = [
-  // debug only: echoTool,  
+  // debug only: echoTool,
+  getCurrentUserTool,
   postgrestRequestTool,
   sqlToRestTool,  
 ]
