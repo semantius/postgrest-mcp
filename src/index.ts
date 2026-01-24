@@ -99,8 +99,7 @@ app.get("/", (c) => {
     message: "MCP OAuth Server",
     endpoints: {
       mcp: "/mcp",
-      metadata: `${BASE_HOST}${BASE_PATH}/.well-known/oauth-protected-resource`,
-      webhook: "/hook/:id"
+      metadata: `${BASE_HOST}${BASE_PATH}/.well-known/oauth-protected-resource`
     }
   });
 });

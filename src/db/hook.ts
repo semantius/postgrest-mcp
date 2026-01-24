@@ -13,6 +13,15 @@ type WebhookRequest = {
   body: string;
 };
 
+// Result codes for webhook_receiver_logs.result column
+enum WebhookResult {
+  SUCCESS = 10,
+  SIGNATURE_FAILED = 20,
+  INVALID_JSON = 30,
+  TABLE_NOT_FOUND = 40,
+  INSERT_FAILED = 50,
+}
+
 export async function handleHook(c: Context) {
   const db = getDatabase();
   
@@ -23,121 +32,67 @@ export async function handleHook(c: Context) {
       return c.json({ error: 'Invalid webhook_receiver_id' }, 400);
     }
 
-    // Parse request body
+    // Parse and validate request
     const requestData = await c.req.json<WebhookRequest>();
-    
     if (!requestData.headers || !requestData.body) {
       return c.json({ error: 'Missing required fields: headers and body' }, 400);
     }
 
-    // Extract headers (case-insensitive)
+    // Normalize headers to lowercase
     const headers: Record<string, string> = {};
     Object.keys(requestData.headers).forEach(key => {
       headers[key.toLowerCase()] = requestData.headers[key];
     });
 
     const webhookId = headers['webhook-id'];
-    // Use current timestamp if not provided (in seconds since epoch)
     const webhookTimestampStr = headers['webhook-timestamp'] || Math.floor(Date.now() / 1000).toString();
     const webhookSignature = headers['webhook-signature'];
     const bodyStr = requestData.body;
 
-    // Use webhook-id as idempotency_key, will be replaced later if needed
-    let idempotencyKey = webhookId || '';
-
-    // Step 1: Find webhook_receivers record
-    const receiverResult = await sql`
-      SELECT id, label, table_name, auth_type, secret
-      FROM webhook_receivers
-      WHERE id = ${webhookReceiverId}
-    `.execute(db);
-
-    if (receiverResult.rows.length === 0) {
+    // Find webhook receiver configuration
+    const receiver = await findWebhookReceiver(db, webhookReceiverId);
+    if (!receiver) {
       return c.json({ error: 'Webhook receiver not found' }, 404);
     }
 
-    const receiver = receiverResult.rows[0] as {
-      id: number;
-      label: string;
-      table_name: string;
-      auth_type: string;
-      secret: string | null;
-    };
+    // Validate signature if HMAC auth is enabled
+    const signatureValidation = await validateSignature(
+      receiver,
+      webhookId,
+      webhookTimestampStr,
+      bodyStr,
+      webhookSignature
+    );
 
-    // Step 2: Compute and verify webhook signature
-    if (receiver.auth_type === 'hmac') {
-      if (!receiver.secret) {
-        return c.json({ error: 'HMAC secret not configured' }, 500);
-      }
-
-      if (!webhookId || !webhookSignature) {
-        return c.json({ error: 'Missing webhook-id or webhook-signature for HMAC validation' }, 400);
-      }
-
-      const isValid = await verifyWebhookSignature(
-        webhookId,
-        webhookTimestampStr,
-        bodyStr,
-        receiver.secret,
-        webhookSignature
+    if (!signatureValidation.valid) {
+      await logWebhookAttempt(
+        db,
+        webhookReceiverId,
+        webhookId || 'unknown',
+        parseInt(webhookTimestampStr),
+        { headers, body: bodyStr },
+        WebhookResult.SIGNATURE_FAILED,
+        signatureValidation.error || 'Signature verification failed'
       );
-
-      if (!isValid) {
-        // Log failed attempt - use webhook-id as idempotency key for HMAC webhooks
-        await logWebhookAttempt(
-          db,
-          webhookReceiverId,
-          webhookId,
-          parseInt(webhookTimestampStr),
-          { headers, body: bodyStr },
-          20, // result code for signature mismatch
-          'Signature verification failed'
-        );
-        return c.json({ error: 'Signature verification failed' }, 401);
-      }
-    } else {
-      // For auth_type=none, compute signature for idempotency
-      if (receiver.secret && webhookId) {
-        const computedSig = await computeWebhookSignature(
-          webhookId,
-          webhookTimestampStr,
-          bodyStr,
-          receiver.secret
-        );
-        idempotencyKey = computedSig;
-      }
+      return c.json({ error: signatureValidation.error }, 401);
     }
 
-    // Use signature as idempotency_key if idempotency_key is empty
-    if (!idempotencyKey && webhookSignature) {
-      idempotencyKey = webhookSignature;
-    }
+    // Compute idempotency key
+    const idempotencyKey = await computeIdempotencyKey(
+      receiver,
+      webhookId,
+      webhookTimestampStr,
+      bodyStr,
+      webhookSignature,
+      webhookReceiverId
+    );
 
-    // If still no idempotency_key, compute one based on webhook content
-    if (!idempotencyKey) {
-      // Generate a hash from webhook data for idempotency
-      const idempotencySource = `${webhookReceiverId}-${webhookTimestampStr}-${bodyStr}`;
-      idempotencyKey = await computeWebhookSignature(
-        webhookId || 'anon',
-        webhookTimestampStr,
-        bodyStr,
-        receiver.secret || idempotencySource
-      );
-    }
-
-    // Step 3: Check for duplicate using idempotency_key
-    const duplicateResult = await sql`
-      SELECT id FROM webhook_receiver_logs
-      WHERE webhook_receiver_id = ${webhookReceiverId}
-      AND webhook_id = ${idempotencyKey}
-    `.execute(db);
-
-    if (duplicateResult.rows.length > 0) {
-      // Duplicate request, return success without processing
+    // Check for duplicate
+    if (await isDuplicateRequest(db, webhookReceiverId, idempotencyKey)) {
       return c.json({ success: true, message: 'Duplicate request ignored' }, 200);
     }
 
-    // Step 4: Parse webhook body
+    // Parse webhook body
     let webhookData: any;
     try {
       webhookData = JSON.parse(bodyStr);
@@ -148,76 +103,35 @@ export async function handleHook(c: Context) {
         idempotencyKey,
         parseInt(webhookTimestampStr),
         { headers, body: bodyStr },
-        30,
+        WebhookResult.INVALID_JSON,
         'Invalid JSON in body'
       );
       return c.json({ error: 'Invalid JSON in body' }, 400);
     }
 
-    // Step 5: Get table metadata
-    const tableResult = await sql`
-      SELECT table_name, id_column
-      FROM tables
-      WHERE table_name = ${receiver.table_name}
-    `.execute(db);
-
-    if (tableResult.rows.length === 0) {
+    // Get table and field metadata
+    const tableMetadata = await getTableMetadata(db, receiver.table_name);
+    if (!tableMetadata) {
       await logWebhookAttempt(
         db,
         webhookReceiverId,
         idempotencyKey,
         parseInt(webhookTimestampStr),
         { headers, body: bodyStr },
-        40,
+        WebhookResult.TABLE_NOT_FOUND,
         `Table metadata not found for ${receiver.table_name}`
       );
       return c.json({ error: `Table metadata not found for ${receiver.table_name}` }, 404);
     }
 
-    const tableMetadata = tableResult.rows[0] as { table_name: string; id_column: string | null };
+    const fieldNames = await getFieldNames(db, receiver.table_name);
 
-    // Step 6: Get field definitions
-    const fieldsResult = await sql`
-      SELECT field_name, format, is_pk, is_nullable
-      FROM fields
-      WHERE table_name = ${receiver.table_name}
-    `.execute(db);
+    // Filter webhook data to only include defined fields
+    const insertData = filterWebhookData(webhookData, fieldNames);
 
-    const fieldNames = new Set(fieldsResult.rows.map((f: any) => f.field_name));
-
-    // Step 7: Build insert/upsert data - only include fields that exist in the table
-    const insertData: Record<string, any> = {};
-    for (const key in webhookData) {
-      if (fieldNames.has(key)) {
-        insertData[key] = webhookData[key];
-      }
-    }
-
-    // Step 8: Execute insert or upsert using raw SQL
+    // Execute insert or upsert
     try {
-      const idColumn = tableMetadata.id_column;
-      // Check if ID field exists and has a non-null value
-      const hasIdValue = idColumn && webhookData[idColumn] !== undefined && webhookData[idColumn] !== null;
-
-      const columns = Object.keys(insertData);
-      const values = Object.values(insertData);
-
-      if (hasIdValue && idColumn) {
-        // Upsert: ON CONFLICT DO UPDATE
-        const updateSet = columns.map(col => `${col} = EXCLUDED.${col}`).join(', ');
-        await sql`
-          INSERT INTO ${sql.table(receiver.table_name)} (${sql.join(columns.map(c => sql.id(c)))})
-          VALUES (${sql.join(values.map(v => sql.lit(v)))})
-          ON CONFLICT (${sql.id(idColumn)}) 
-          DO UPDATE SET ${sql.raw(updateSet)}
-        `.execute(db);
-      } else {
-        // Insert only
-        await sql`
-          INSERT INTO ${sql.table(receiver.table_name)} (${sql.join(columns.map(c => sql.id(c)))})
-          VALUES (${sql.join(values.map(v => sql.lit(v)))})
-        `.execute(db);
-      }
+      await insertOrUpsertData(db, receiver.table_name, insertData, webhookData, tableMetadata.id_column);
 
       // Log success
       await logWebhookAttempt(
@@ -226,29 +140,208 @@ export async function handleHook(c: Context) {
         idempotencyKey,
         parseInt(webhookTimestampStr),
         { headers, body: bodyStr },
-        10, // success code
+        WebhookResult.SUCCESS,
         null
       );
 
       return c.json({ success: true }, 200);
     } catch (error: any) {
       // Log failure
-      const errorMessage = error.message || 'Unknown error during insert/upsert';
       await logWebhookAttempt(
         db,
         webhookReceiverId,
         idempotencyKey,
         parseInt(webhookTimestampStr),
         { headers, body: bodyStr },
-        50, // insert/upsert failure code
-        errorMessage
+        WebhookResult.INSERT_FAILED,
+        error.message || 'Unknown error during insert/upsert'
       );
 
-      return c.json({ error: 'Failed to insert/upsert data', details: errorMessage }, 500);
+      return c.json({ error: 'Failed to insert/upsert data', details: error.message }, 500);
     }
   } catch (error: any) {
     console.error('Webhook handler error:', error);
     return c.json({ error: 'Internal server error', details: error.message }, 500);
+  }
+}
+
+/**
+ * Find webhook receiver configuration by ID
+ */
+async function findWebhookReceiver(db: any, webhookReceiverId: number) {
+  const result = await sql`
+    SELECT id, label, table_name, auth_type, secret
+    FROM webhook_receivers
+    WHERE id = ${webhookReceiverId}
+  `.execute(db);
+
+  if (result.rows.length === 0) {
+    return null;
+  }
+
+  return result.rows[0] as {
+    id: number;
+    label: string;
+    table_name: string;
+    auth_type: string;
+    secret: string | null;
+  };
+}
+
+/**
+ * Validate webhook signature for HMAC auth
+ */
+async function validateSignature(
+  receiver: { auth_type: string; secret: string | null },
+  webhookId: string | undefined,
+  webhookTimestampStr: string,
+  bodyStr: string,
+  webhookSignature: string | undefined
+): Promise<{ valid: boolean; error?: string }> {
+  if (receiver.auth_type !== 'hmac') {
+    return { valid: true };
+  }
+
+  if (!receiver.secret) {
+    return { valid: false, error: 'HMAC secret not configured' };
+  }
+
+  if (!webhookId || !webhookSignature) {
+    return { valid: false, error: 'Missing webhook-id or webhook-signature for HMAC validation' };
+  }
+
+  const isValid = await verifyWebhookSignature(
+    webhookId,
+    webhookTimestampStr,
+    bodyStr,
+    receiver.secret,
+    webhookSignature
+  );
+
+  return isValid ? { valid: true } : { valid: false, error: 'Signature verification failed' };
+}
+
+/**
+ * Compute idempotency key based on auth type and available data
+ */
+async function computeIdempotencyKey(
+  receiver: { auth_type: string; secret: string | null },
+  webhookId: string | undefined,
+  webhookTimestampStr: string,
+  bodyStr: string,
+  webhookSignature: string | undefined,
+  webhookReceiverId: number
+): Promise<string> {
+  // For HMAC, use webhook-id
+  if (receiver.auth_type === 'hmac' && webhookId) {
+    return webhookId;
+  }
+
+  // For non-HMAC with secret, compute signature for idempotency
+  if (receiver.secret && webhookId) {
+    return await computeWebhookSignature(webhookId, webhookTimestampStr, bodyStr, receiver.secret);
+  }
+
+  // Use signature if available
+  if (webhookSignature) {
+    return webhookSignature;
+  }
+
+  // Fallback: compute from content
+  const idempotencySource = `${webhookReceiverId}-${webhookTimestampStr}-${bodyStr}`;
+  return await computeWebhookSignature(
+    webhookId || 'anon',
+    webhookTimestampStr,
+    bodyStr,
+    receiver.secret || idempotencySource
+  );
+}
+
+/**
+ * Check if request is duplicate based on idempotency key
+ */
+async function isDuplicateRequest(db: any, webhookReceiverId: number, idempotencyKey: string): Promise<boolean> {
+  const result = await sql`
+    SELECT id FROM webhook_receiver_logs
+    WHERE webhook_receiver_id = ${webhookReceiverId}
+    AND webhook_id = ${idempotencyKey}
+  `.execute(db);
+
+  return result.rows.length > 0;
+}
+
+/**
+ * Get table metadata
+ */
+async function getTableMetadata(db: any, tableName: string) {
+  const result = await sql`
+    SELECT table_name, id_column
+    FROM tables
+    WHERE table_name = ${tableName}
+  `.execute(db);
+
+  if (result.rows.length === 0) {
+    return null;
+  }
+
+  return result.rows[0] as { table_name: string; id_column: string | null };
+}
+
+/**
+ * Get field names for a table
+ */
+async function getFieldNames(db: any, tableName: string): Promise<Set<string>> {
+  const result = await sql`
+    SELECT field_name
+    FROM fields
+    WHERE table_name = ${tableName}
+  `.execute(db);
+
+  return new Set(result.rows.map((f: any) => f.field_name));
+}
+
+/**
+ * Filter webhook data to only include fields defined in the table
+ */
+function filterWebhookData(webhookData: any, fieldNames: Set<string>): Record<string, any> {
+  const insertData: Record<string, any> = {};
+  for (const key in webhookData) {
+    if (fieldNames.has(key)) {
+      insertData[key] = webhookData[key];
+    }
+  }
+  return insertData;
+}
+
+/**
+ * Insert or upsert data into target table
+ */
+async function insertOrUpsertData(
+  db: any,
+  tableName: string,
+  insertData: Record<string, any>,
+  webhookData: any,
+  idColumn: string | null
+) {
+  const hasIdValue = idColumn && webhookData[idColumn] !== undefined && webhookData[idColumn] !== null;
+  const columns = Object.keys(insertData);
+  const values = Object.values(insertData);
+
+  if (hasIdValue && idColumn) {
+    // Upsert: ON CONFLICT DO UPDATE
+    const updateSet = columns.map(col => `${col} = EXCLUDED.${col}`).join(', ');
+    await sql`
+      INSERT INTO ${sql.table(tableName)} (${sql.join(columns.map(c => sql.id(c)))})
+      VALUES (${sql.join(values.map(v => sql.lit(v)))})
+      ON CONFLICT (${sql.id(idColumn)}) 
+      DO UPDATE SET ${sql.raw(updateSet)}
+    `.execute(db);
+  } else {
+    // Insert only
+    await sql`
+      INSERT INTO ${sql.table(tableName)} (${sql.join(columns.map(c => sql.id(c)))})
+      VALUES (${sql.join(values.map(v => sql.lit(v)))})
+    `.execute(db);
   }
 }
 
@@ -261,7 +354,7 @@ async function logWebhookAttempt(
   idempotencyKey: string,
   webhookTimestamp: number,
   payload: any,
-  result: number,
+  result: WebhookResult,
   errorMessage: string | null
 ) {
   try {
