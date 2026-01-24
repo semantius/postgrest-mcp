@@ -93,10 +93,10 @@ export async function handleWebhook(c: Context) {
       );
 
       if (!isValid) {
-        // Log failed attempt
+        // Log failed attempt - use webhook-id as idempotency key for HMAC webhooks
         await logWebhookAttempt(
           webhookReceiverId,
-          webhookId,
+          webhookId, // For HMAC, webhook-id is the idempotency key
           parseInt(webhookTimestampStr),
           { headers, body: bodyStr },
           20, // result code for signature mismatch
@@ -203,7 +203,8 @@ export async function handleWebhook(c: Context) {
     // Step 8: Execute insert or upsert
     try {
       const idColumn = tableMetadata.id_column;
-      const hasIdValue = idColumn && webhookData[idColumn] !== undefined;
+      // Check if ID field exists and has a non-null value (0, empty string, etc. are valid IDs)
+      const hasIdValue = idColumn && webhookData[idColumn] !== undefined && webhookData[idColumn] !== null;
 
       if (hasIdValue) {
         // Upsert: update if exists, insert if not
@@ -260,7 +261,7 @@ export async function handleWebhook(c: Context) {
  */
 async function logWebhookAttempt(
   webhookReceiverId: number,
-  webhookId: string,
+  idempotencyKey: string,
   webhookTimestamp: number,
   payload: any,
   result: number,
@@ -272,7 +273,7 @@ async function logWebhookAttempt(
       method: 'POST',
       body: {
         webhook_receiver_id: webhookReceiverId,
-        webhook_id: webhookId,
+        webhook_id: idempotencyKey, // webhook_id field stores the idempotency key
         webhook_timestamp: new Date(webhookTimestamp * 1000).toISOString(),
         payload: payload,
         result: result,
