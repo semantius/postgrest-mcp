@@ -7,6 +7,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createMcpServer } from "./mcp.ts";
 import { getEnv } from "./utils/env.ts";
+import { handleHook } from "./db/hook.ts";
 
 const SUPABASE_URL = getEnv("SUPABASE_URL");
 const BASE_HOST = SUPABASE_URL ? new URL(SUPABASE_URL).host : "";
@@ -93,17 +94,8 @@ const oauthMetadataHandler = (c: any) => {
 app.get(`${BASE_PATH}/.well-known/oauth-protected-resource`, oauthMetadataHandler);
 app.get("/.well-known/oauth-protected-resource", oauthMetadataHandler);
 
-// Root endpoint for health check
-app.get("/", (c) => {
-  return c.json({
-    status: "ok",
-    message: "MCP OAuth Server",
-    endpoints: {
-      mcp: "/mcp",
-      metadata: `${BASE_HOST}${BASE_PATH}/.well-known/oauth-protected-resource`
-    }
-  });
-});
+// Webhook receiver endpoint - changed from GET to POST
+app.post("/hook/:id", handleHook);
 
 // Catch-all route for 404
 app.all("*", (c) => {
