@@ -1,38 +1,23 @@
 /**
- * Webhook receiver handler
- * Handles POST /hook/:id requests
+ * Webhook receiver handler using Kysely for direct database access
+ * Bypasses RLS policies to insert webhook data directly
  */
 
 import { Context } from 'hono';
-import { makePostgrestRequest } from '../utils/postgrest.ts';
+import { sql as rawSql } from 'kysely';
+import { createDb, type Database } from '../utils/db.ts';
 import { computeWebhookSignature, verifyWebhookSignature } from '../utils/webhook.ts';
+import type { Kysely } from 'kysely';
 
-interface WebhookRequest {
+// Request payload shape
+type WebhookRequest = {
   headers: Record<string, string>;
   body: string;
-}
-
-interface WebhookReceiver {
-  id: number;
-  label: string;
-  table_name: string;
-  auth_type: string;
-  secret: string | null;
-}
-
-interface TableMetadata {
-  table_name: string;
-  id_column: string | null;
-}
-
-interface FieldMetadata {
-  field_name: string;
-  format: string;
-  is_pk: boolean;
-  is_nullable: boolean;
-}
+};
 
 export async function handleWebhook(c: Context) {
+  const db = createDb();
+  
   try {
     // Extract webhook_receiver_id from URL path
     const webhookReceiverId = parseInt(c.req.param('id'));
@@ -62,17 +47,16 @@ export async function handleWebhook(c: Context) {
     // Use webhook-id as idempotency_key, will be replaced later if needed
     let idempotencyKey = webhookId || '';
 
-    // Step 1: Find webhook_receivers record
-    const receiverResponse = await makePostgrestRequest({
-      path: `/webhook_receivers?id=eq.${webhookReceiverId}`,
-      method: 'GET',
-    });
+    // Step 1: Find webhook_receivers record using Kysely
+    const receiver = await db
+      .selectFrom('webhook_receivers')
+      .selectAll()
+      .where('id', '=', webhookReceiverId)
+      .executeTakeFirst();
 
-    if (!receiverResponse.response.data || receiverResponse.response.data.length === 0) {
+    if (!receiver) {
       return c.json({ error: 'Webhook receiver not found' }, 404);
     }
-
-    const receiver: WebhookReceiver = receiverResponse.response.data[0];
 
     // Step 2: Compute and verify webhook signature
     if (receiver.auth_type === 'hmac') {
@@ -95,6 +79,7 @@ export async function handleWebhook(c: Context) {
       if (!isValid) {
         // Log failed attempt - use webhook-id as idempotency key for HMAC webhooks
         await logWebhookAttempt(
+          db,
           webhookReceiverId,
           webhookId, // For HMAC, webhook-id is the idempotency key
           parseInt(webhookTimestampStr),
@@ -123,10 +108,8 @@ export async function handleWebhook(c: Context) {
     }
 
     // If still no idempotency_key, compute one based on webhook content
-    // This ensures idempotency even for webhooks without authentication
     if (!idempotencyKey) {
       // Generate a hash from webhook data for idempotency
-      // Use a combination that's unique to this specific webhook
       const idempotencySource = `${webhookReceiverId}-${webhookTimestampStr}-${bodyStr}`;
       idempotencyKey = await computeWebhookSignature(
         webhookId || 'anon',
@@ -136,13 +119,15 @@ export async function handleWebhook(c: Context) {
       );
     }
 
-    // Step 3: Check for duplicate using idempotency_key
-    const duplicateCheck = await makePostgrestRequest({
-      path: `/webhook_receiver_logs?webhook_receiver_id=eq.${webhookReceiverId}&webhook_id=eq.${encodeURIComponent(idempotencyKey)}`,
-      method: 'GET',
-    });
+    // Step 3: Check for duplicate using idempotency_key with Kysely
+    const existingLog = await db
+      .selectFrom('webhook_receiver_logs')
+      .selectAll()
+      .where('webhook_receiver_id', '=', webhookReceiverId)
+      .where('webhook_id', '=', idempotencyKey)
+      .executeTakeFirst();
 
-    if (duplicateCheck.response.data && duplicateCheck.response.data.length > 0) {
+    if (existingLog) {
       // Duplicate request, return success without processing
       return c.json({ success: true, message: 'Duplicate request ignored' }, 200);
     }
@@ -153,6 +138,7 @@ export async function handleWebhook(c: Context) {
       webhookData = JSON.parse(bodyStr);
     } catch (e) {
       await logWebhookAttempt(
+        db,
         webhookReceiverId,
         idempotencyKey,
         parseInt(webhookTimestampStr),
@@ -163,14 +149,16 @@ export async function handleWebhook(c: Context) {
       return c.json({ error: 'Invalid JSON in body' }, 400);
     }
 
-    // Step 5: Get table metadata
-    const tableResponse = await makePostgrestRequest({
-      path: `/tables?table_name=eq.${receiver.table_name}`,
-      method: 'GET',
-    });
+    // Step 5: Get table metadata using Kysely
+    const tableMetadata = await db
+      .selectFrom('tables')
+      .selectAll()
+      .where('table_name', '=', receiver.table_name)
+      .executeTakeFirst();
 
-    if (!tableResponse.response.data || tableResponse.response.data.length === 0) {
+    if (!tableMetadata) {
       await logWebhookAttempt(
+        db,
         webhookReceiverId,
         idempotencyKey,
         parseInt(webhookTimestampStr),
@@ -181,15 +169,13 @@ export async function handleWebhook(c: Context) {
       return c.json({ error: `Table metadata not found for ${receiver.table_name}` }, 404);
     }
 
-    const tableMetadata: TableMetadata = tableResponse.response.data[0];
+    // Step 6: Get field definitions using Kysely
+    const fields = await db
+      .selectFrom('fields')
+      .selectAll()
+      .where('table_name', '=', receiver.table_name)
+      .execute();
 
-    // Step 6: Get field definitions
-    const fieldsResponse = await makePostgrestRequest({
-      path: `/fields?table_name=eq.${receiver.table_name}`,
-      method: 'GET',
-    });
-
-    const fields: FieldMetadata[] = fieldsResponse.response.data || [];
     const fieldNames = new Set(fields.map(f => f.field_name));
 
     // Step 7: Build insert/upsert data
@@ -200,33 +186,34 @@ export async function handleWebhook(c: Context) {
       }
     }
 
-    // Step 8: Execute insert or upsert
+    // Step 8: Execute insert or upsert using Kysely with raw SQL
     try {
       const idColumn = tableMetadata.id_column;
-      // Check if ID field exists and has a non-null value (0, empty string, etc. are valid IDs)
+      // Check if ID field exists and has a non-null value
       const hasIdValue = idColumn && webhookData[idColumn] !== undefined && webhookData[idColumn] !== null;
 
       if (hasIdValue) {
-        // Upsert: update if exists, insert if not
-        await makePostgrestRequest({
-          path: `/${receiver.table_name}`,
-          method: 'POST',
-          body: insertData,
-          additionalHeaders: {
-            'Prefer': 'resolution=merge-duplicates',
-          },
-        });
+        // Upsert: ON CONFLICT DO UPDATE
+        const columns = Object.keys(insertData);
+        const values = Object.values(insertData);
+        
+        await rawSql`
+          INSERT INTO ${rawSql.table(receiver.table_name)} (${rawSql.join(columns.map(c => rawSql.id(c)))})
+          VALUES (${rawSql.join(values.map(v => rawSql.lit(v)))})
+          ON CONFLICT (${rawSql.id(idColumn)}) 
+          DO UPDATE SET ${rawSql.join(columns.map(c => rawSql`${rawSql.id(c)} = EXCLUDED.${rawSql.id(c)}`))}
+        `.execute(db);
       } else {
         // Insert only
-        await makePostgrestRequest({
-          path: `/${receiver.table_name}`,
-          method: 'POST',
-          body: insertData,
-        });
+        await rawSql`
+          INSERT INTO ${rawSql.table(receiver.table_name)} (${rawSql.join(Object.keys(insertData).map(c => rawSql.id(c)))})
+          VALUES (${rawSql.join(Object.values(insertData).map(v => rawSql.lit(v)))})
+        `.execute(db);
       }
 
       // Log success
       await logWebhookAttempt(
+        db,
         webhookReceiverId,
         idempotencyKey,
         parseInt(webhookTimestampStr),
@@ -240,6 +227,7 @@ export async function handleWebhook(c: Context) {
       // Log failure
       const errorMessage = error.message || 'Unknown error during insert/upsert';
       await logWebhookAttempt(
+        db,
         webhookReceiverId,
         idempotencyKey,
         parseInt(webhookTimestampStr),
@@ -253,13 +241,16 @@ export async function handleWebhook(c: Context) {
   } catch (error: any) {
     console.error('Webhook handler error:', error);
     return c.json({ error: 'Internal server error', details: error.message }, 500);
+  } finally {
+    await db.destroy();
   }
 }
 
 /**
- * Log webhook attempt to webhook_receiver_logs
+ * Log webhook attempt to webhook_receiver_logs using Kysely
  */
 async function logWebhookAttempt(
+  db: Kysely<Database>,
   webhookReceiverId: number,
   idempotencyKey: string,
   webhookTimestamp: number,
@@ -268,18 +259,21 @@ async function logWebhookAttempt(
   errorMessage: string | null
 ) {
   try {
-    await makePostgrestRequest({
-      path: '/webhook_receiver_logs',
-      method: 'POST',
-      body: {
+    await db
+      .insertInto('webhook_receiver_logs')
+      .values({
         webhook_receiver_id: webhookReceiverId,
         webhook_id: idempotencyKey, // webhook_id field stores the idempotency key
-        webhook_timestamp: new Date(webhookTimestamp * 1000).toISOString(),
-        payload: payload,
+        webhook_timestamp: new Date(webhookTimestamp * 1000),
+        received_timestamp: new Date(),
+        payload: JSON.stringify(payload),
         result: result,
         error_message: errorMessage,
-      },
-    });
+        label: null,
+        created_at: new Date(),
+        updated_at: new Date(),
+      })
+      .execute();
   } catch (error) {
     console.error('Failed to log webhook attempt:', error);
   }

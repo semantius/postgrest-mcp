@@ -10,8 +10,8 @@ This document describes the comprehensive test scenarios for the webhook receive
   - `tables`
   - `fields`
   - At least one test table (e.g., `customers`)
-- PostgREST API endpoint configured
-- Environment variables set (SUPABASE_URL, API_KEY or SUPABASE_ANON_KEY)
+- Direct database connection via DATABASE_URL environment variable
+- Kysely bypasses RLS policies using service role credentials
 
 ## Test Data Setup
 
