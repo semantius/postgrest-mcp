@@ -7,7 +7,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createMcpServer } from "./mcp.ts";
 import { getEnv } from "./utils/env.ts";
-import { handleWebhook } from "./handlers/webhook.ts";
+import { handleHook } from "./db/hook.ts";
 
 const SUPABASE_URL = getEnv("SUPABASE_URL");
 const BASE_HOST = SUPABASE_URL ? new URL(SUPABASE_URL).host : "";
@@ -105,8 +105,8 @@ app.get("/", (c) => {
   });
 });
 
-// Webhook receiver endpoint
-app.post("/hook/:id", handleWebhook);
+// Webhook receiver endpoint - changed from GET to POST
+app.post("/hook/:id", handleHook);
 
 // Catch-all route for 404
 app.all("*", (c) => {
