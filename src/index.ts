@@ -92,18 +92,6 @@ const oauthMetadataHandler = (c: any) => {
 app.get(`${BASE_PATH}/.well-known/oauth-protected-resource`, oauthMetadataHandler);
 app.get("/.well-known/oauth-protected-resource", oauthMetadataHandler);
 
-// Root endpoint for health check
-app.get("/", (c) => {
-  return c.json({
-    status: "ok",
-    message: "MCP OAuth Server",
-    endpoints: {
-      mcp: "/mcp",
-      metadata: `${BASE_HOST}${BASE_PATH}/.well-known/oauth-protected-resource`
-    }
-  });
-});
-
 // Webhook receiver endpoint - changed from GET to POST
 app.post("/hook/:id", handleHook);
 
