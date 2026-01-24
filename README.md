@@ -131,26 +131,6 @@ deno task deploy
 
 The MCP endpoint will be available at: `https://<your-project>.deno.dev/mcp`
 
-## Webhook Receiver
-
-The server includes a webhook receiver endpoint at `POST /hook/:id` that validates, deduplicates, and processes incoming webhooks.
-
-### Features
-- **HMAC signature validation** using standard webhook format (`webhook-id.webhook-timestamp.body`)
-- **Idempotency checking** prevents duplicate processing
-- **Dynamic data insertion** based on table metadata from `tables` and `fields` tables
-- **RLS bypass** via Kysely direct database access (requires `DATABASE_URL` with service role credentials)
-- **Comprehensive logging** in `webhook_receiver_logs` table
-
-### Configuration
-Set the `DATABASE_URL` environment variable with a connection string that has permissions to bypass RLS:
-```bash
-DATABASE_URL=postgresql://postgres:[PASSWORD]@[HOST]/[DATABASE]
-```
-
-### Usage
-See `tests/TESTING.md` for detailed test scenarios and setup instructions.
-
 ## Credits
 
 This implementation is based on [supabase-mcp](https://github.com/supabase-community/supabase-mcp/tree/main/packages/mcp-server-postgrest).

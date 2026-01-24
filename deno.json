@@ -16,8 +16,6 @@
     "hono": "npm:hono@^4.11.4",
     "hono/cors": "npm:hono@^4.11.4/cors",
     "jose": "npm:jose@^6.1.3",
-    "kysely": "npm:kysely@^0.27.4",
-    "pg": "npm:pg@^8.13.1",
     "zod/v4": "npm:zod@^4.3.5/v4"
   },
   "compilerOptions": {
