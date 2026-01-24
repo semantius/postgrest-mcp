@@ -97,6 +97,19 @@ app.get("/.well-known/oauth-protected-resource", oauthMetadataHandler);
 // Webhook receiver endpoint - changed from GET to POST
 app.post("/hook/:id", handleHook);
 
+// Root endpoint for mcp discovery
+app.get("/", (c) => {
+  return c.json({
+    status: "ok",
+    message: "MCP OAuth Server",
+    endpoints: {
+      mcp: "/mcp",
+      metadata: `${BASE_HOST}${BASE_PATH}/.well-known/oauth-protected-resource`
+    }
+  });
+});
+
+
 // Catch-all route for 404
 app.all("*", (c) => {
   console.log(`404 - Route not found: ${c.req.url}`);

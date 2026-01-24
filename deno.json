@@ -1,7 +1,4 @@
 {
-  "name": "postgrest-mcp",
-  "version": "1.0.0",
-  "license": "Apache-2.0",
   "tasks": {
     "dev": "deno run --allow-net --allow-env --watch src/index.deno.ts",
     "start": "deno run --allow-net --allow-env src/index.deno.ts",

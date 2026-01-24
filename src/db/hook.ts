@@ -32,22 +32,18 @@ export async function handleHook(c: Context) {
       return c.json({ error: 'Invalid webhook_receiver_id' }, 400);
     }
 
-    // Parse and validate request
-    const requestData = await c.req.json<WebhookRequest>();
-    if (!requestData.headers || !requestData.body) {
-      return c.json({ error: 'Missing required fields: headers and body' }, 400);
-    }
+    // Get raw body as string
+    const bodyStr = await c.req.text();
 
-    // Normalize headers to lowercase
+    // Normalize headers to lowercase from actual HTTP headers
     const headers: Record<string, string> = {};
-    Object.keys(requestData.headers).forEach(key => {
-      headers[key.toLowerCase()] = requestData.headers[key];
+    c.req.raw.headers.forEach((value, key) => {
+      headers[key.toLowerCase()] = value;
     });
 
     const webhookId = headers['webhook-id'];
     const webhookTimestampStr = headers['webhook-timestamp'] || Math.floor(Date.now() / 1000).toString();
     const webhookSignature = headers['webhook-signature'];
-    const bodyStr = requestData.body;
 
     // Find webhook receiver configuration
     const receiver = await findWebhookReceiver(db, webhookReceiverId);
@@ -87,8 +83,9 @@ export async function handleHook(c: Context) {
       webhookReceiverId
     );
 
-    // Check for duplicate
-    if (await isDuplicateRequest(db, webhookReceiverId, idempotencyKey)) {
+    // Check for successful duplicate (only skip if previous request succeeded)
+    const duplicateStatus = await isDuplicateRequest(db, webhookReceiverId, idempotencyKey);
+    if (duplicateStatus === 'success') {
       return c.json({ success: true, message: 'Duplicate request ignored' }, 200);
     }
 
@@ -129,6 +126,24 @@ export async function handleHook(c: Context) {
     // Filter webhook data to only include defined fields
     const insertData = filterWebhookData(webhookData, fieldNames);
 
+    // Validate that we have at least one field to insert
+    if (Object.keys(insertData).length === 0) {
+      await logWebhookAttempt(
+        db,
+        webhookReceiverId,
+        idempotencyKey,
+        parseInt(webhookTimestampStr),
+        { headers, body: bodyStr },
+        WebhookResult.INSERT_FAILED,
+        `No matching fields found in webhook data. Available fields: ${Array.from(fieldNames).join(', ')}. Received data: ${JSON.stringify(webhookData)}`
+      );
+      return c.json({ 
+        error: 'No matching fields found in webhook data',
+        availableFields: Array.from(fieldNames),
+        receivedData: webhookData
+      }, 400);
+    }
+
     // Execute insert or upsert
     try {
       await insertOrUpsertData(db, receiver.table_name, insertData, webhookData, tableMetadata.id_column);
@@ -146,6 +161,16 @@ export async function handleHook(c: Context) {
 
       return c.json({ success: true }, 200);
     } catch (error: any) {
+      // Enhanced error logging
+      console.error('Insert/upsert failed:', {
+        table: receiver.table_name,
+        insertData,
+        webhookData,
+        idColumn: tableMetadata.id_column,
+        error: error.message,
+        stack: error.stack
+      });
+
       // Log failure
       await logWebhookAttempt(
         db,
@@ -157,7 +182,15 @@ export async function handleHook(c: Context) {
         error.message || 'Unknown error during insert/upsert'
       );
 
-      return c.json({ error: 'Failed to insert/upsert data', details: error.message }, 500);
+      return c.json({ 
+        error: 'Failed to insert/upsert data', 
+        details: error.message,
+        table: receiver.table_name,
+        insertData,
+        webhookData,
+        idColumn: tableMetadata.id_column,
+        stack: error.stack
+      }, 500);
     }
   } catch (error: any) {
     console.error('Webhook handler error:', error);
@@ -259,15 +292,23 @@ async function computeIdempotencyKey(
 
 /**
  * Check if request is duplicate based on idempotency key
+ * Returns 'success' if duplicate and was successful, 'failed' if duplicate but failed, null if not duplicate
  */
-async function isDuplicateRequest(db: any, webhookReceiverId: number, idempotencyKey: string): Promise<boolean> {
+async function isDuplicateRequest(db: any, webhookReceiverId: number, idempotencyKey: string): Promise<'success' | 'failed' | null> {
   const result = await sql`
-    SELECT id FROM webhook_receiver_logs
+    SELECT result FROM webhook_receiver_logs
     WHERE webhook_receiver_id = ${webhookReceiverId}
     AND webhook_id = ${idempotencyKey}
+    ORDER BY received_timestamp DESC
+    LIMIT 1
   `.execute(db);
 
-  return result.rows.length > 0;
+  if (result.rows.length === 0) {
+    return null;
+  }
+
+  // WebhookResult.SUCCESS = 10
+  return result.rows[0].result === 10 ? 'success' : 'failed';
 }
 
 /**
@@ -302,11 +343,13 @@ async function getFieldNames(db: any, tableName: string): Promise<Set<string>> {
 
 /**
  * Filter webhook data to only include fields defined in the table
+ * Excludes readonly fields like created_at and updated_at
  */
 function filterWebhookData(webhookData: any, fieldNames: Set<string>): Record<string, any> {
+  const readonlyFields = new Set(['created_at', 'updated_at']);
   const insertData: Record<string, any> = {};
   for (const key in webhookData) {
-    if (fieldNames.has(key)) {
+    if (fieldNames.has(key) && !readonlyFields.has(key)) {
       insertData[key] = webhookData[key];
     }
   }
