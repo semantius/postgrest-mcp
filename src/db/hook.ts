@@ -6,6 +6,7 @@
 import { Context } from "hono";
 import { getDatabase, sql } from "./client.ts";
 import { computeWebhookSignature, verifyWebhookSignature } from "../utils/webhook.ts";
+import jsonata from "jsonata";
 
 // Request payload shape
 type WebhookRequest = {
@@ -20,6 +21,7 @@ enum WebhookResult {
   INVALID_JSON = 30,
   TABLE_NOT_FOUND = 40,
   INSERT_FAILED = 50,
+  JSONATA_ERROR = 60,
 }
 
 export async function handleHook(c: Context) {
@@ -114,7 +116,7 @@ export async function handleHook(c: Context) {
       return c.json({ error: 'Invalid JSON in body' }, 400);
     }
 
-    // Get table and field metadata
+    // Get table metadata early for ID preservation
     const tableMetadata = await getTableMetadata(db, receiver.table_name);
     if (!tableMetadata) {
       try {
@@ -133,6 +135,54 @@ export async function handleHook(c: Context) {
       return c.json({ error: `Table metadata not found for ${receiver.table_name}` }, 404);
     }
 
+    // Apply JSONata transformation if configured
+    if (receiver.jsonata && receiver.jsonata.trim()) {
+      const originalData = webhookData;
+      const idColumn = tableMetadata.id_column;
+      const originalIdValue = idColumn ? originalData[idColumn] : undefined;
+      
+      try {
+        const expression = jsonata(receiver.jsonata);
+        webhookData = await expression.evaluate(webhookData);
+        
+        // Preserve ID field if it existed in original but was removed by transformation
+        if (idColumn && originalIdValue !== undefined && originalIdValue !== null) {
+          if (webhookData === null || webhookData === undefined) {
+            webhookData = {};
+          }
+          if (webhookData[idColumn] === undefined || webhookData[idColumn] === null) {
+            webhookData[idColumn] = originalIdValue;
+          }
+        }
+      } catch (jsonataError: any) {
+        const errorMsg = `JSONata transformation failed: ${jsonataError.message}`;
+        console.error(errorMsg, {
+          expression: receiver.jsonata,
+          originalData: webhookData,
+          error: jsonataError
+        });
+        
+        try {
+          await logWebhookAttempt(
+            db,
+            webhookReceiverId,
+            idempotencyKey,
+            parseInt(webhookTimestampStr),
+            { headers, body: bodyStr },
+            WebhookResult.JSONATA_ERROR,
+            errorMsg
+          );
+        } catch (logError: any) {
+          console.error('Failed to log JSONata error:', logError);
+        }
+        
+        // Exclude stack trace from error response
+        const { stack, ...errorDetails } = jsonataError;
+        return c.json({ error: 'JSONata transformation failed', details: errorDetails }, 400);
+      }
+    }
+
+    // Get field metadata
     const fieldNames = await getFieldNames(db, receiver.table_name);
 
     // Filter webhook data to only include defined fields
@@ -225,7 +275,7 @@ export async function handleHook(c: Context) {
  */
 async function findWebhookReceiver(db: any, webhookReceiverId: number) {
   const result = await sql`
-    SELECT id, label, table_name, auth_type, secret
+    SELECT id, label, table_name, auth_type, secret, jsonata
     FROM webhook_receivers
     WHERE id = ${webhookReceiverId}
   `.execute(db);
@@ -240,6 +290,7 @@ async function findWebhookReceiver(db: any, webhookReceiverId: number) {
     table_name: string;
     auth_type: string;
     secret: string | null;
+    jsonata: string | null;
   };
 }
 
@@ -389,20 +440,40 @@ async function insertOrUpsertData(
   idColumn: string | null
 ) {
   const hasIdValue = idColumn && webhookData[idColumn] !== undefined && webhookData[idColumn] !== null;
-  const columns = Object.keys(insertData);
-  const values = Object.values(insertData);
+  
+  // CRITICAL: If an ID is provided in the webhook data, we MUST include it in the insert
+  // Otherwise, PostgreSQL will auto-generate a new ID, which is NEVER what we want
+  const finalInsertData = { ...insertData };
+  if (hasIdValue && idColumn && webhookData[idColumn] !== undefined) {
+    finalInsertData[idColumn] = webhookData[idColumn];
+  }
+  
+  const columns = Object.keys(finalInsertData);
+  const values = Object.values(finalInsertData);
 
   if (hasIdValue && idColumn) {
     // Upsert: ON CONFLICT DO UPDATE
-    const updateSet = columns.map(col => `${col} = EXCLUDED.${col}`).join(', ');
-    await sql`
-      INSERT INTO ${sql.table(tableName)} (${sql.join(columns.map(c => sql.id(c)))})
-      VALUES (${sql.join(values.map(v => sql.lit(v)))})
-      ON CONFLICT (${sql.id(idColumn)}) 
-      DO UPDATE SET ${sql.raw(updateSet)}
-    `.execute(db);
+    const updateSet = columns.filter(col => col !== idColumn).map(col => `${col} = EXCLUDED.${col}`).join(', ');
+    
+    // If there are no columns to update (only id provided), skip the UPDATE clause
+    if (updateSet) {
+      await sql`
+        INSERT INTO ${sql.table(tableName)} (${sql.join(columns.map(c => sql.id(c)))})
+        VALUES (${sql.join(values.map(v => sql.lit(v)))})
+        ON CONFLICT (${sql.id(idColumn)}) 
+        DO UPDATE SET ${sql.raw(updateSet)}
+      `.execute(db);
+    } else {
+      // Only id provided, use DO NOTHING on conflict
+      await sql`
+        INSERT INTO ${sql.table(tableName)} (${sql.join(columns.map(c => sql.id(c)))})
+        VALUES (${sql.join(values.map(v => sql.lit(v)))})
+        ON CONFLICT (${sql.id(idColumn)}) 
+        DO NOTHING
+      `.execute(db);
+    }
   } else {
-    // Insert only
+    // Insert only (no id provided, let database auto-generate)
     await sql`
       INSERT INTO ${sql.table(tableName)} (${sql.join(columns.map(c => sql.id(c)))})
       VALUES (${sql.join(values.map(v => sql.lit(v)))})
