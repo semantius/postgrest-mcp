@@ -61,15 +61,19 @@ export async function handleHook(c: Context) {
     );
 
     if (!signatureValidation.valid) {
-      await logWebhookAttempt(
-        db,
-        webhookReceiverId,
-        webhookId || 'unknown',
-        parseInt(webhookTimestampStr),
-        { headers, body: bodyStr },
-        WebhookResult.SIGNATURE_FAILED,
-        signatureValidation.error || 'Signature verification failed'
-      );
+      try {
+        await logWebhookAttempt(
+          db,
+          webhookReceiverId,
+          webhookId || 'unknown',
+          parseInt(webhookTimestampStr),
+          { headers, body: bodyStr },
+          WebhookResult.SIGNATURE_FAILED,
+          signatureValidation.error || 'Signature verification failed'
+        );
+      } catch (logError: any) {
+        console.error('Failed to log signature failure:', logError);
+      }
       return c.json({ error: signatureValidation.error }, 401);
     }
 
@@ -94,30 +98,38 @@ export async function handleHook(c: Context) {
     try {
       webhookData = JSON.parse(bodyStr);
     } catch (e) {
-      await logWebhookAttempt(
-        db,
-        webhookReceiverId,
-        idempotencyKey,
-        parseInt(webhookTimestampStr),
-        { headers, body: bodyStr },
-        WebhookResult.INVALID_JSON,
-        'Invalid JSON in body'
-      );
+      try {
+        await logWebhookAttempt(
+          db,
+          webhookReceiverId,
+          idempotencyKey,
+          parseInt(webhookTimestampStr),
+          { headers, body: bodyStr },
+          WebhookResult.INVALID_JSON,
+          'Invalid JSON in body'
+        );
+      } catch (logError: any) {
+        console.error('Failed to log invalid JSON:', logError);
+      }
       return c.json({ error: 'Invalid JSON in body' }, 400);
     }
 
     // Get table and field metadata
     const tableMetadata = await getTableMetadata(db, receiver.table_name);
     if (!tableMetadata) {
-      await logWebhookAttempt(
-        db,
-        webhookReceiverId,
-        idempotencyKey,
-        parseInt(webhookTimestampStr),
-        { headers, body: bodyStr },
-        WebhookResult.TABLE_NOT_FOUND,
-        `Table metadata not found for ${receiver.table_name}`
-      );
+      try {
+        await logWebhookAttempt(
+          db,
+          webhookReceiverId,
+          idempotencyKey,
+          parseInt(webhookTimestampStr),
+          { headers, body: bodyStr },
+          WebhookResult.TABLE_NOT_FOUND,
+          `Table metadata not found for ${receiver.table_name}`
+        );
+      } catch (logError: any) {
+        console.error('Failed to log table not found:', logError);
+      }
       return c.json({ error: `Table metadata not found for ${receiver.table_name}` }, 404);
     }
 
@@ -128,15 +140,19 @@ export async function handleHook(c: Context) {
 
     // Validate that we have at least one field to insert
     if (Object.keys(insertData).length === 0) {
-      await logWebhookAttempt(
-        db,
-        webhookReceiverId,
-        idempotencyKey,
-        parseInt(webhookTimestampStr),
-        { headers, body: bodyStr },
-        WebhookResult.INSERT_FAILED,
-        `No matching fields found in webhook data. Available fields: ${Array.from(fieldNames).join(', ')}. Received data: ${JSON.stringify(webhookData)}`
-      );
+      try {
+        await logWebhookAttempt(
+          db,
+          webhookReceiverId,
+          idempotencyKey,
+          parseInt(webhookTimestampStr),
+          { headers, body: bodyStr },
+          WebhookResult.INSERT_FAILED,
+          `No matching fields found in webhook data. Available fields: ${Array.from(fieldNames).join(', ')}. Received data: ${JSON.stringify(webhookData)}`
+        );
+      } catch (logError: any) {
+        console.error('Failed to log no matching fields:', logError);
+      }
       return c.json({ 
         error: 'No matching fields found in webhook data',
         availableFields: Array.from(fieldNames),
@@ -144,21 +160,23 @@ export async function handleHook(c: Context) {
       }, 400);
     }
 
-    // Execute insert or upsert
+    // Execute insert or upsert within a transaction (with logging)
     try {
-      await insertOrUpsertData(db, receiver.table_name, insertData, webhookData, tableMetadata.id_column);
-
-      // Log success
-      await logWebhookAttempt(
-        db,
-        webhookReceiverId,
-        idempotencyKey,
-        parseInt(webhookTimestampStr),
-        { headers, body: bodyStr },
-        WebhookResult.SUCCESS,
-        null
-      );
-
+      await db.transaction().execute(async (trx: any) => {
+        await insertOrUpsertData(trx, receiver.table_name, insertData, webhookData, tableMetadata.id_column);
+        
+        // Log success within the same transaction
+        await logWebhookAttempt(
+          trx,
+          webhookReceiverId,
+          idempotencyKey,
+          parseInt(webhookTimestampStr),
+          { headers, body: bodyStr },
+          WebhookResult.SUCCESS,
+          null
+        );
+      });
+      
       return c.json({ success: true }, 200);
     } catch (error: any) {
       // Enhanced error logging
@@ -172,15 +190,19 @@ export async function handleHook(c: Context) {
       });
 
       // Log failure
-      await logWebhookAttempt(
-        db,
-        webhookReceiverId,
-        idempotencyKey,
-        parseInt(webhookTimestampStr),
-        { headers, body: bodyStr },
-        WebhookResult.INSERT_FAILED,
-        error.message || 'Unknown error during insert/upsert'
-      );
+      try {
+        await logWebhookAttempt(
+          db,
+          webhookReceiverId,
+          idempotencyKey,
+          parseInt(webhookTimestampStr),
+          { headers, body: bodyStr },
+          WebhookResult.INSERT_FAILED,
+          error.message || 'Unknown error during insert/upsert'
+        );
+      } catch (logError: any) {
+        console.error('Failed to log insert failure:', logError);
+      }
 
       return c.json({ 
         error: 'Failed to insert/upsert data', 
@@ -401,6 +423,14 @@ async function logWebhookAttempt(
   errorMessage: string | null
 ) {
   try {
+    console.log('Attempting to log webhook:', {
+      webhookReceiverId,
+      idempotencyKey,
+      webhookTimestamp,
+      result,
+      errorMessage
+    });
+    
     await sql`
       INSERT INTO webhook_receiver_logs (
         webhook_receiver_id, webhook_id, webhook_timestamp, 
@@ -413,11 +443,22 @@ async function logWebhookAttempt(
         ${new Date()},
         ${JSON.stringify(payload)},
         ${result},
-        ${errorMessage}
+        ${errorMessage ?? ''}
       )
     `.execute(db);
-  } catch (error) {
-    console.error('Failed to log webhook attempt:', error);
+    
+    console.log('Successfully logged webhook attempt');
+  } catch (error: any) {
+    console.error('Failed to log webhook attempt:', {
+      error: error.message,
+      stack: error.stack,
+      code: error.code,
+      detail: error.detail,
+      webhookReceiverId,
+      idempotencyKey
+    });
+    // Re-throw to make logging failures visible
+    throw new Error(`Logging failed: ${error.message}`);
   }
 }
 

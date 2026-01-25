@@ -2,6 +2,19 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import { Pool } from 'pg';
 import { getEnv } from '../utils/env.ts';
 
+// Detect runtime and conditionally import Deno postgres driver
+const isDeno = typeof Deno !== 'undefined';
+let DenoPool: any = null;
+
+if (isDeno) {
+  try {
+    const mod = await import('postgres');
+    DenoPool = mod.Pool;
+  } catch (e) {
+    console.warn('Failed to load Deno postgres driver, falling back to pg:', e);
+  }
+}
+
 let db: Kysely<any> | null = null;
 
 /**
@@ -17,17 +30,22 @@ export function getDatabase(): Kysely<any> {
       throw new Error('DATABASE_URL or SUPABASE_DB_URL environment variable is not set');
     }
 
-    const dialect = new PostgresDialect({
-      pool: new Pool({
-        connectionString: databaseUrl,
-        // Connection pool settings - adjust based on your provider
-        max: 10,
-      })
-    });
-
-    db = new Kysely<any>({
-      dialect,
-    });
+    if (isDeno && DenoPool) {
+      // Use Deno native driver (avoids readFileSync warning)
+      const dialect = new PostgresDialect({
+        pool: new DenoPool(databaseUrl, 10) as any
+      });
+      db = new Kysely<any>({ dialect });
+    } else {
+      // Use Node.js pg driver for other environments (Cloudflare, etc.)
+      const dialect = new PostgresDialect({
+        pool: new Pool({
+          connectionString: databaseUrl,
+          max: 10,
+        })
+      });
+      db = new Kysely<any>({ dialect });
+    }
   }
 
   return db;
