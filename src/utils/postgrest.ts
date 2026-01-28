@@ -67,7 +67,16 @@ export async function makePostgrestRequest(options: PostgrestRequestOptions): Pr
 
   if (!response.ok) {
     const errorText = await response.text()
-    throw new Error(`PostgREST request failed: ${response.status} ${response.statusText} - ${errorText}`)
+    let errmsg = errorText
+    try {
+      const json = JSON.parse(errorText)
+      errmsg = json.message || errorText
+      if (json.code) errmsg = `(${json.code}) ${errmsg}`
+      console.error('PostgREST request failed:', url.toString(), method, body, json)
+    } catch {
+      console.error('PostgREST request failed:', url.toString(), method, body, errorText)
+    }
+    throw new Error(errmsg)
   }
 
   const responseData = await response.json()

@@ -40,7 +40,6 @@ export const postgrestRequestTool: Tool<typeof inputSchema, undefined> = {
       }
     }
     catch (error: any) {
-      console.error('PostgREST request failed:', error)
       return {
         content: [
           {

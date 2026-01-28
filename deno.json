@@ -16,7 +16,7 @@
     "jose": "npm:jose@^6.1.3",
     "kysely": "npm:kysely@^0.28.10",
     "pg": "npm:pg@^8.17.2",
-    "postgres": "jsr:@denodrivers/postgres@^0.20.1",
+    "postgres": "npm:postgres@^3.4.5",
     "zod/v4": "npm:zod@^4.3.6/v4"
   },
   "compilerOptions": {
